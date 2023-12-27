@@ -13,12 +13,15 @@ also determine when no answer is supported by the paragraph and abstain from ans
 
 Homepage: https://rajpurkar.github.io/SQuAD-explorer/
 """
-import datasets
-from math import exp
-from lm_eval.base import rf, Task
 from functools import partial
-from packaging import version
 
+import datasets
+import torch
+from math import exp
+from packaging import version
+from transformers import AutoTokenizer, AutoModel
+
+from lm_eval.base import rf, Task
 
 _CITATION = """
 @misc{rajpurkar2018know,
@@ -32,15 +35,37 @@ _CITATION = """
 """
 
 
+def similarity_metric(data):
+    predictions, _ = zip(*data)
+    predictions = [p["prediction_text"] for p in predictions]
+    # calculate the average similarity between the predictions sentences
+    model = AutoModel.from_pretrained("NousResearch/Llama-2-7b-hf")
+    tokenizer = AutoTokenizer.from_pretrained("NousResearch/Llama-2-7b-hf")
+    inputs = tokenizer(predictions, padding = True, return_tensors = "pt", add_special_tokens = False)
+    model.eval()
+    with torch.no_grad():
+        embeddings = model.embed_tokens(inputs["input_ids"])
+        # sum sentence embeddings but not padding embeddings
+        sentence_embeddings = embeddings * inputs["attention_mask"].unsqueeze(-1).expand(embeddings.size())
+        sentence_embeddings = sentence_embeddings.sum(dim = 1) / inputs["attention_mask"].sum(dim = 1).unsqueeze(-1)
+        # calculate the average similarity between the predictions sentences
+        similarities = []
+        for i in range(len(predictions)):
+            for j in range(i + 1, len(predictions)):
+                similarities.append(
+                    torch.cosine_similarity(sentence_embeddings[i], sentence_embeddings[j], dim = 0).item())
+    return sum(similarities) / len(similarities)
+
+
 def _squad_metric(predictions, references):
     squad_metric = datasets.load_metric("squad_v2")
-    return squad_metric.compute(predictions=predictions, references=references)
+    return squad_metric.compute(predictions = predictions, references = references)
 
 
 def _squad_agg(key, items):
     predictions, references = zip(*items)
 
-    return _squad_metric(predictions=predictions, references=references).get(key, 0)
+    return _squad_metric(predictions = predictions, references = references).get(key, 0)
 
 
 class SQuAD2(Task):
@@ -70,16 +95,16 @@ class SQuAD2(Task):
 
     def doc_to_text(self, doc):
         return (
-            "Title: "
-            + doc["title"]
-            + "\n\n"
-            + "Background: "
-            + doc["context"]
-            + "\n\n"
-            + "Question: "
-            + doc["question"]
-            + "\n\n"
-            + "Answer:"
+                "Title: "
+                + doc["title"]
+                + "\n\n"
+                + "Background: "
+                + doc["context"]
+                + "\n\n"
+                + "Question: "
+                + doc["question"]
+                + "\n\n"
+                + "Answer:"
         )
 
     def should_decontaminate(self):
@@ -137,6 +162,7 @@ class SQuAD2(Task):
         }
 
         return {
+            "similarity": (predictions, references),
             "exact": (
                 predictions,
                 references,
@@ -175,6 +201,7 @@ class SQuAD2(Task):
             functions that aggregate a list of metrics
         """
         return {
+            "similarity": similarity_metric,
             "exact": partial(
                 _squad_agg, "exact"
             ),  # Exact match (the normalized answer exactly match the gold answer)
@@ -208,6 +235,7 @@ class SQuAD2(Task):
             whether a higher value of the submetric is better
         """
         return {
+            "similarity": True,
             "exact": True,  # Exact match (the normalized answer exactly match the gold answer)
             "f1": True,  # The F-score of predicted tokens versus the gold answer
             "HasAns_exact": True,  # Exact match (the normalized answer exactly match the gold answer)
